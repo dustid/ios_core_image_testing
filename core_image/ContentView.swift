@@ -152,9 +152,9 @@ class CameraViewModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     func laplacian(image: CGImage) -> CGImage? {
         let commandBuffer = self.commandQueue.makeCommandBuffer()!
 
-        let laplacian = MPSImageLaplacian(device: self.device)
-
-
+        let laplacian = MPSImageCanny(device: self.device)
+        laplacian.edgeMode = .clamp
+        
         let textureLoader = MTKTextureLoader(device: self.device)
         let options: [MTKTextureLoader.Option : Any]? = nil
         let srcTex = try! textureLoader.newTexture(cgImage: image, options: options)
@@ -201,108 +201,50 @@ class CameraViewModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
                         from: MTLRegionMake2D(0, 0, lapTex.width, lapTex.height),
                         mipmapLevel: 0)
         
-        //let im = overlayImageWithTexture(originalImage: image, texture: lapTex)
+        let im = bitmapContext.makeImage()
         
-        return bitmapContext.makeImage()
+        let ni = blendImages(bottomImage: image, topImage: im!)
+        
+        return ni
     }
     
+    func blendImages(bottomImage: CGImage, topImage: CGImage) -> CGImage? {
+        let bottomSize = CGSize(width: bottomImage.width, height: bottomImage.height)
+        let topSize = CGSize(width: topImage.width, height: topImage.height)
 
-    func overlayImageWithTexture(originalImage: CGImage, texture: MTLTexture) -> CGImage? {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            return nil
-        }
-        
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.noneSkipLast.rawValue
-        let bytesPerPixel = 4
-        let bytesPerRow = originalImage.width * bytesPerPixel
-        let context = CGContext(data: nil,
-                                width: originalImage.width,
-                                height: originalImage.height,
-                                bitsPerComponent: 8,
-                                bytesPerRow: bytesPerRow,
-                                space: colorSpace,
-                                bitmapInfo: bitmapInfo)!
-        
-        // Draw the original image onto the context
-        context.draw(originalImage, in: CGRect(x: 0, y: 0, width: originalImage.width, height: originalImage.height))
-        
-        // Create a Metal texture descriptor matching the original image properties
-        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
-                                                                         width: originalImage.width,
-                                                                         height: originalImage.height,
-                                                                         mipmapped: false)
-        textureDescriptor.usage = [.shaderRead, .shaderWrite]
-        
-        // Create a Metal texture from the context's data
-        guard let metalTexture = device.makeTexture(descriptor: textureDescriptor) else {
+
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        guard let context = CGContext(data: nil,
+                                      width: Int(bottomSize.width),
+                                      height: Int(bottomSize.height),
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: 0,
+                                      space: colorSpace,
+                                      bitmapInfo: bitmapInfo.rawValue) else {
             return nil
         }
-        metalTexture.replace(region: MTLRegionMake2D(0, 0, originalImage.width, originalImage.height),
-                             mipmapLevel: 0,
-                             withBytes: context.data!,
-                             bytesPerRow: bytesPerRow)
-        
-        // Create a Metal library and compute pipeline state
-        guard let library = device.makeDefaultLibrary(),
-              let kernelFunction = library.makeFunction(name: "overlayBlendKernel"),
-              let pipelineState = try? device.makeComputePipelineState(function: kernelFunction) else {
+
+        context.interpolationQuality = .high
+
+        context.draw(bottomImage, in: CGRect(origin: .zero, size: bottomSize))
+
+        let maskColor = UIColor.black.cgColor
+        let transparentColor = UIColor.green.cgColor
+
+        context.clip(to: CGRect(origin: .zero, size: topSize), mask: topImage)
+        context.setFillColor(transparentColor)
+        context.fill(CGRect(origin: .zero, size: bottomSize))
+
+        context.setFillColor(transparentColor)
+        context.setBlendMode(.darken)
+        context.draw(topImage, in: CGRect(origin: .zero, size: topSize))
+
+        guard let blendedImage = context.makeImage() else {
             return nil
         }
-        
-        // Create a command buffer and encoder
-        guard let commandQueue = device.makeCommandQueue(),
-              let commandBuffer = commandQueue.makeCommandBuffer(),
-              let commandEncoder = commandBuffer.makeComputeCommandEncoder() else {
-            return nil
-        }
-        
-        // Set up the compute pipeline state
-        commandEncoder.setComputePipelineState(pipelineState)
-        
-        // Set the original image and overlay texture as input textures
-        commandEncoder.setTexture(metalTexture, index: 0)
-        commandEncoder.setTexture(texture, index: 1)
-        
-        // Create an output texture for the blended result
-        let outputTextureDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
-                                                                              width: originalImage.width,
-                                                                              height: originalImage.height,
-                                                                              mipmapped: false)
-        outputTextureDescriptor.usage = [.shaderRead, .shaderWrite]
-        let outputTexture = device.makeTexture(descriptor: outputTextureDescriptor)!
-        commandEncoder.setTexture(outputTexture, index: 2)
-        
-        // Set up the thread groups and dispatch the compute kernel
-        let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
-        let threadGroups = MTLSize(width: (originalImage.width + threadGroupSize.width - 1) / threadGroupSize.width,
-                                   height: (originalImage.height + threadGroupSize.height - 1) / threadGroupSize.height,
-                                   depth: 1)
-        commandEncoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
-        
-        // End encoding the command encoder and commit the command buffer
-        commandEncoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        
-        // Retrieve the modified Metal texture data
-        let modifiedBytesPerRow = outputTexture.width * bytesPerPixel
-        let modifiedData = UnsafeMutablePointer<UInt8>.allocate(capacity: outputTexture.height * modifiedBytesPerRow)
-        outputTexture.getBytes(modifiedData,
-                               bytesPerRow: modifiedBytesPerRow,
-                               from: MTLRegionMake2D(0, 0, outputTexture.width, outputTexture.height),
-                               mipmapLevel: 0)
-        
-        // Copy the modified texture data to the context
-        context.data?.copyMemory(from: modifiedData, byteCount: outputTexture.height * modifiedBytesPerRow)
-        
-        // Create a CGImage from the modified context
-        let modifiedImage = context.makeImage()
-        
-        // Free the allocated memory
-        modifiedData.deallocate()
-        
-        return modifiedImage
+
+        return blendedImage
     }
 
 
